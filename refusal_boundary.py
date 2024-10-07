@@ -10,13 +10,13 @@ import logging
 from tqdm import tqdm
 from scipy.stats import ttest_1samp
 import warnings
-from utils import patch_open, logging_cuda_memory_usage, get_following_indices
+from utils import patch_open, log_gpu_memory, get_response_indices
 from safetensors import safe_open
 import gc
 import random
 from matplotlib import pyplot as plt
 from sklearn.decomposition import PCA
-from utils import PCA_DIM
+from utils import PCA_COMPONENTS
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 
@@ -27,45 +27,43 @@ logging.basicConfig(
 warnings.simplefilter("ignore")
 
 
-def smooth_fn(x0, temp=2):
-    x0 = np.minimum(np.maximum(x0, 0.01), 0.99)
-    x = np.power(x0, 1 / temp) / (np.power(x0, 1 / temp) + np.power(1 - x0, 1 / temp))
-    return x
+def apply_smoothing(values, temperature=2):
+    clamped = np.clip(values, 0.01, 0.99)
+    smoothed = np.power(clamped, 1 / temperature) / (np.power(clamped, 1 / temperature) + np.power(1 - clamped, 1 / temperature))
+    return smoothed
 
 
-def calculate_boundary(xlim, ylim, weight, bias):
-    if np.abs(weight[0]) > np.abs(weight[1]):
-        xlim_by_ylim_0 = (-bias - weight[1] * ylim[0]) / weight[0]
-        xlim_by_ylim_1 = (-bias - weight[1] * ylim[1]) / weight[0]
-        return [(xlim_by_ylim_0, ylim[0]), (xlim_by_ylim_1, ylim[1])]
+def compute_decision_boundary(x_range, y_range, coefficients, intercept):
+    if abs(coefficients[0]) > abs(coefficients[1]):
+        x1 = (-intercept - coefficients[1] * y_range[0]) / coefficients[0]
+        x2 = (-intercept - coefficients[1] * y_range[1]) / coefficients[0]
+        return [(x1, y_range[0]), (x2, y_range[1])]
     else:
-        ylim_by_xlim_0 = (-bias - weight[0] * xlim[0]) / weight[1]
-        ylim_by_xlim_1 = (-bias - weight[0] * xlim[1]) / weight[1]
-        return [(xlim[0], ylim_by_xlim_0), (xlim[1], ylim_by_xlim_1)]
+        y1 = (-intercept - coefficients[0] * x_range[0]) / coefficients[1]
+        y2 = (-intercept - coefficients[0] * x_range[1]) / coefficients[1]
+        return [(x_range[0], y1), (x_range[1], y2)]
 
 
 def main():
     patch_open()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pretrained_model_paths", type=str, nargs='+', required=True)
-    parser.add_argument("--system_prompt_type", type=str, choices=['all'], required=True)
-    parser.add_argument("--config", type=str, choices=["greedy", "sampling"])
-    parser.add_argument("--output_path", type=str, required=True)
+    parser.add_argument("--model_paths", type=str, nargs='+', required=True)
+    parser.add_argument("--prompt_style", type=str, choices=['all'], required=True)
+    parser.add_argument("--generation_mode", type=str, choices=["greedy", "sampling"])
+    parser.add_argument("--output_dir", type=str, required=True)
     args = parser.parse_args()
 
-    # prepare data
-    fname = f'{args.system_prompt_type}_refusal_boundary'
-    fname += "_custom"
-    dataset = 'custom'
-    with open(f"./data/custom.txt") as f:
-        lines = f.readlines()
-    with open(f"./data_harmless/custom.txt") as f:
-        lines_harmless = f.readlines()
-    os.makedirs(args.output_path, exist_ok=True)
+    # Data preparation
+    output_filename = f'{args.prompt_style}_refusal_boundary_custom'
+    dataset_name = 'custom'
+    with open("./data/custom.txt") as f:
+        harmful_queries = [line.strip() for line in f if line.strip()]
+    with open("./data_harmless/custom.txt") as f:
+        harmless_queries = [line.strip() for line in f if line.strip()]
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    #colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    colors = {
+    color_scheme = {
         'harmless': 'tab:blue',
         'harmful': 'tab:red',
         'harmless + default': 'tab:cyan',
@@ -76,250 +74,161 @@ def main():
         'harmful + short': 'tab:orange',
     }
 
-    all_queries = [e.strip() for e in lines if e.strip()]
-    n_queries = len(all_queries)
+    num_harmful_queries = len(harmful_queries)
+    num_harmless_queries = len(harmless_queries)
 
-    all_queries_harmless = [e.strip() for e in lines_harmless if e.strip()]
-    n_queries_harmless = len(all_queries_harmless)
+    cols = 4
+    if len(args.model_paths) % cols != 0:
+        raise ValueError(f"Number of models must be divisible by {cols}")
+    rows = len(args.model_paths) // cols
+    main_fig, main_axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 4.5 * rows))
+    aux_fig, aux_axes = plt.subplots(rows, cols)
 
-    ncols = 4
-    if len(args.pretrained_model_paths) % ncols != 0:
-        raise ValueError(f"len(args.pretrained_model_paths) % ncols != 0")
-    nrows = len(args.pretrained_model_paths) // ncols
-    fig = plt.figure(figsize=(4.5 * ncols, 4.5 * nrows))
-    fig2 = plt.figure()
-
-    for mdx, pretrained_model_path in enumerate(args.pretrained_model_paths):
-        logging_cuda_memory_usage()
+    for model_index, model_path in enumerate(args.model_paths):
+        log_gpu_memory()
         torch.cuda.empty_cache()
         gc.collect()
 
-        logging.info(pretrained_model_path)
+        logging.info(f"Processing model: {model_path}")
 
-        # prepare model
-        model_name = pretrained_model_path.split('/')[-1]
-        config = AutoConfig.from_pretrained(pretrained_model_path)
-        num_layers = config.num_hidden_layers
+        # Model preparation
+        model_name = model_path.split('/')[-1]
+        model_config = AutoConfig.from_pretrained(model_path)
+        num_layers = model_config.num_hidden_layers
 
+        # Process different prompt styles
+        prompt_styles = ['', 'default', 'mistral', 'short']
+        all_hidden_states = {}
+        all_scores = {}
 
-        # w/o
-        logging.info(f"Running w/o")
-        hidden_states = safe_open(f'hidden_states_harmless/{model_name}_{dataset}.safetensors',
-                                  framework='pt', device=0)
-        all_hidden_states_harmless = []
-        for idx, query in enumerate(all_queries):
-            tmp_hidden_states = hidden_states.get_tensor(f'sample.{idx}_layer.{num_layers-1}')[-1]
-            all_hidden_states_harmless.append(tmp_hidden_states)
+        for style in prompt_styles:
+            suffix = f"_with_{style}" if style else ""
+            suffix_harm = "_harmless" if style else ""
+            
+            logging.info(f"Processing {style if style else 'base'} prompt")
+            
+            # Load harmless hidden states
+            harmless_states = safe_open(f'hidden_states_harmless/{model_name}{suffix}_{dataset_name}.safetensors', framework='pt', device=0)
+            all_hidden_states[f'harmless{suffix}'] = torch.stack([
+                harmless_states.get_tensor(f'sample.{idx}_layer.{num_layers-1}')[-1]
+                for idx, _ in enumerate(harmless_queries)
+            ])
 
-        hidden_states = safe_open(f'hidden_states/{model_name}_{dataset}.safetensors',
-                                  framework='pt', device=0)
-        all_hidden_states = []
-        for idx, query in enumerate(all_queries):
-            tmp_hidden_states = hidden_states.get_tensor(f'sample.{idx}_layer.{num_layers-1}')[-1]
-            all_hidden_states.append(tmp_hidden_states)
+            # Load harmful hidden states
+            harmful_states = safe_open(f'hidden_states/{model_name}{suffix}_{dataset_name}.safetensors', framework='pt', device=0)
+            all_hidden_states[f'harmful{suffix}'] = torch.stack([
+                harmful_states.get_tensor(f'sample.{idx}_layer.{num_layers-1}')[-1]
+                for idx, _ in enumerate(harmful_queries)
+            ])
 
+            # Get scores
+            all_scores[f'harmless{suffix}'] = get_response_indices(
+                model_name, config=args.generation_mode, use_harmless=True, return_only_scores=True,
+                **{f'use_{style}_prompt': bool(style)} if style else {}
+            )
+            all_scores[f'harmful{suffix}'] = get_response_indices(
+                model_name, config=args.generation_mode, use_harmless=False, return_only_scores=True,
+                **{f'use_{style}_prompt': bool(style)} if style else {}
+            )
 
-        all_hidden_states = torch.stack(all_hidden_states)
-        all_hidden_states_harmless = torch.stack(all_hidden_states_harmless)
+        # Convert scores to tensors
+        for key, value in all_scores.items():
+            all_scores[key] = torch.tensor(value, device='cuda', dtype=torch.float)
 
+        # Combine hidden states and perform PCA
+        combined_hidden_states = torch.cat(list(all_hidden_states.values()), dim=0).float()
+        pca = PCA(PCA_COMPONENTS, random_state=42)
+        pca_result = pca.fit_transform(combined_hidden_states.cpu().numpy())
+        pca_mean = torch.tensor(pca.mean_, device='cuda', dtype=torch.float)
+        pca_components = torch.tensor(pca.components_.T, device='cuda', dtype=torch.float)
+        logging.info(f"PCA explained variance: {pca.explained_variance_ratio_}, total: {np.sum(pca.explained_variance_ratio_)}")
 
-        # default
-        logging.info(f"Running default")
-        hidden_states_with_default = safe_open(f'hidden_states_harmless/{model_name}_with_default_{dataset}.safetensors',
-                                                        framework='pt', device=0)
-        all_hidden_states_with_default_harmless = []
-        for idx, query_harmless in enumerate(all_queries_harmless):
-            tmp_hidden_states = hidden_states_with_default.get_tensor(f'sample.{idx}_layer.{num_layers-1}')[-1]
-            all_hidden_states_with_default_harmless.append(tmp_hidden_states)
+        reduced_dim = torch.matmul(combined_hidden_states - pca_mean, pca_components)
 
-        hidden_states_with_default = safe_open(f'hidden_states/{model_name}_with_default_{dataset}.safetensors',
-                                                framework='pt', device=0)
-        all_hidden_states_with_default = []
-        for idx, query in enumerate(all_queries):
-            tmp_hidden_states = hidden_states_with_default.get_tensor(f'sample.{idx}_layer.{num_layers-1}')[-1]
-            all_hidden_states_with_default.append(tmp_hidden_states)
-
-
-        all_hidden_states_with_default = torch.stack(all_hidden_states_with_default)
-        all_hidden_states_with_default_harmless = torch.stack(all_hidden_states_with_default_harmless)
-
-
-        # mistral
-        logging.info(f"Running mistral")
-        hidden_states_with_mistral = safe_open(f'hidden_states_harmless/{model_name}_with_mistral_{dataset}.safetensors',
-                                                        framework='pt', device=0)
-        all_hidden_states_with_mistral_harmless = []
-        for idx, query_harmless in enumerate(all_queries_harmless):
-            tmp_hidden_states = hidden_states_with_mistral.get_tensor(f'sample.{idx}_layer.{num_layers-1}')[-1]
-            all_hidden_states_with_mistral_harmless.append(tmp_hidden_states)
-
-        hidden_states_with_mistral = safe_open(f'hidden_states/{model_name}_with_mistral_{dataset}.safetensors',
-                                                framework='pt', device=0)
-        all_hidden_states_with_mistral = []
-        for idx, query in enumerate(all_queries):
-            tmp_hidden_states = hidden_states_with_mistral.get_tensor(f'sample.{idx}_layer.{num_layers-1}')[-1]
-            all_hidden_states_with_mistral.append(tmp_hidden_states)
-
-
-        all_hidden_states_with_mistral = torch.stack(all_hidden_states_with_mistral)
-        all_hidden_states_with_mistral_harmless = torch.stack(all_hidden_states_with_mistral_harmless)
-
-
-        # short
-        logging.info(f"Running short")
-        hidden_states_with_short = safe_open(f'hidden_states_harmless/{model_name}_with_short_{dataset}.safetensors',
-                                                        framework='pt', device=0)
-        all_hidden_states_with_short_harmless = []
-        for idx, query_harmless in enumerate(all_queries_harmless):
-            tmp_hidden_states = hidden_states_with_short.get_tensor(f'sample.{idx}_layer.{num_layers-1}')[-1]
-            all_hidden_states_with_short_harmless.append(tmp_hidden_states)
-
-        hidden_states_with_short = safe_open(f'hidden_states/{model_name}_with_short_{dataset}.safetensors',
-                                                framework='pt', device=0)
-        all_hidden_states_with_short = []
-        for idx, query in enumerate(all_queries):
-            tmp_hidden_states = hidden_states_with_short.get_tensor(f'sample.{idx}_layer.{num_layers-1}')[-1]
-            all_hidden_states_with_short.append(tmp_hidden_states)
-
-
-        all_hidden_states_with_short = torch.stack(all_hidden_states_with_short)
-        all_hidden_states_with_short_harmless = torch.stack(all_hidden_states_with_short_harmless)
-
-
-        scores = get_following_indices(
-            model_name, config=args.config, use_harmless=False, return_only_scores=True)
-        scores_harmless = get_following_indices(
-            model_name, config=args.config, use_harmless=True, return_only_scores=True)
-        scores_with_default = get_following_indices(
-            model_name, config=args.config, use_default_prompt=True, use_harmless=False, return_only_scores=True)
-        scores_with_default_harmless = get_following_indices(
-            model_name, config=args.config, use_default_prompt=True, use_harmless=True, return_only_scores=True)
-        scores_with_mistral = get_following_indices(
-            model_name, config=args.config, use_mistral_prompt=True, use_harmless=False, return_only_scores=True)
-        scores_with_mistral_harmless = get_following_indices(
-            model_name, config=args.config, use_mistral_prompt=True, use_harmless=True, return_only_scores=True)
-        scores_with_short = get_following_indices(
-            model_name, config=args.config, use_short_prompt=True, use_harmless=False, return_only_scores=True)
-        scores_with_short_harmless = get_following_indices(
-            model_name, config=args.config, use_short_prompt=True, use_harmless=True, return_only_scores=True)
-
-
-        scores = torch.tensor(scores, device='cuda', dtype=torch.float)
-        scores_harmless = torch.tensor(scores_harmless, device='cuda', dtype=torch.float)
-        scores_with_default = torch.tensor(scores_with_default, device='cuda', dtype=torch.float)
-        scores_with_default_harmless = torch.tensor(scores_with_default_harmless, device='cuda', dtype=torch.float)
-        scores_with_short = torch.tensor(scores_with_short, device='cuda', dtype=torch.float)
-        scores_with_short_harmless = torch.tensor(scores_with_short_harmless, device='cuda', dtype=torch.float)
-        scores_with_mistral = torch.tensor(scores_with_mistral, device='cuda', dtype=torch.float)
-        scores_with_mistral_harmless = torch.tensor(scores_with_mistral_harmless, device='cuda', dtype=torch.float)
-
-        hidden_states = torch.cat([
-            all_hidden_states_harmless,
-            all_hidden_states_with_default_harmless,
-            all_hidden_states_with_mistral_harmless,
-            all_hidden_states_with_short_harmless,
-            all_hidden_states,
-            all_hidden_states_with_default,
-            all_hidden_states_with_mistral,
-            all_hidden_states_with_short,
-        ], dim=0).float()
-
-        pca = PCA(PCA_DIM, random_state=42)
-        pca.fit(hidden_states.cpu().numpy())
-        mean = torch.tensor(pca.mean_, device='cuda', dtype=torch.float)
-        V = torch.tensor(pca.components_.T, device='cuda', dtype=torch.float)
-        logging.info(f"PCA explained variance ratio: {pca.explained_variance_ratio_}, sum: {np.sum(pca.explained_variance_ratio_)}")
-
-        lower_dim = torch.matmul(hidden_states - mean, V)
-
-        ax = fig.add_subplot(nrows, ncols, mdx + 1)
+        ax = main_fig.add_subplot(rows, cols, model_index + 1)
         ax.set_title(model_name)
         ax.set_aspect(1)
 
-        values = torch.cat([
-            scores_harmless,
-            scores_with_default_harmless,
-            scores_with_mistral_harmless,
-            scores_with_short_harmless,
-            scores,
-            scores_with_default,
-            scores_with_mistral,
-            scores_with_short,
-        ], dim=0)
-        values = values.cpu().numpy()
+        combined_scores = torch.cat(list(all_scores.values()), dim=0)
+        smoothed_scores = apply_smoothing(combined_scores.cpu().numpy())
 
-        values = smooth_fn(values)
+        sample_count = reduced_dim.shape[0]
+        ax.scatter(reduced_dim[:sample_count//2, 0].cpu().numpy(), reduced_dim[:sample_count//2, 1].cpu().numpy(),
+                   marker='o', alpha=0.3, c=smoothed_scores[:sample_count//2], cmap='jet_r')
+        ax.scatter(reduced_dim[sample_count//2:, 0].cpu().numpy(), reduced_dim[sample_count//2:, 1].cpu().numpy(),
+                   marker='x', alpha=0.3, c=smoothed_scores[sample_count//2:], cmap='jet_r')
 
-        num = lower_dim.shape[0]
-        ax.scatter(lower_dim[:num//2, 0].cpu().numpy(), lower_dim[:num//2, 1].cpu().numpy(),
-                   marker='o', alpha=0.3, c=values[:num//2], cmap='jet_r')
-        ax.scatter(lower_dim[num//2:, 0].cpu().numpy(), lower_dim[num//2:, 1].cpu().numpy(),
-                   marker='x', alpha=0.3, c=values[num//2:], cmap='jet_r')
+        scatter = aux_fig.add_subplot(rows, cols, model_index + 1).scatter([], [], c=[], cmap='jet')
+        colormap = scatter.get_cmap()
+        scalar_map = plt.cm.ScalarMappable(cmap=colormap)
+        scalar_map.set_array([])
 
-        scatter = fig2.add_subplot(nrows, ncols, mdx + 1).scatter([], [], c=[], cmap='jet')
-        cmap = scatter.get_cmap()
-        sm = plt.cm.ScalarMappable(cmap=cmap)
-        sm.set_array([])
+        x_limits = ax.get_xlim()
+        y_limits = ax.get_ylim()
 
-        xlim = ax.get_xlim()
-        ylim = ax.get_ylim()
-
-        if xlim[1] - xlim[0] > ylim[1] - ylim[0]:
-            delta = (xlim[1] - xlim[0]) - (ylim[1] - ylim[0])
-            ylim = (ylim[0] - delta / 2, ylim[1] + delta / 2)
+        # Adjust plot limits for square aspect ratio
+        x_range = x_limits[1] - x_limits[0]
+        y_range = y_limits[1] - y_limits[0]
+        if x_range > y_range:
+            delta = x_range - y_range
+            y_limits = (y_limits[0] - delta / 2, y_limits[1] + delta / 2)
         else:
-            delta = (ylim[1] - ylim[0]) - (xlim[1] - xlim[0])
-            xlim = (xlim[0] - delta / 2, xlim[1] + delta / 2)
+            delta = y_range - x_range
+            x_limits = (x_limits[0] - delta / 2, x_limits[1] + delta / 2)
 
+        # Plot harmfulness boundary
         with safe_open(f'estimations/{model_name}_all/harmfulness.safetensors', framework='pt') as f:
-            weight = torch.mean(f.get_tensor('weight'), dim=0).squeeze(0).tolist()
-            bias = torch.mean(f.get_tensor('bias'), dim=0).squeeze(0).tolist()
-        boundary_points = calculate_boundary(xlim, ylim, weight, bias)
-        logging.info(f"harmfulness boundary: {boundary_points}")
+            harm_coef = torch.mean(f.get_tensor('weight'), dim=0).squeeze(0).tolist()
+            harm_intercept = torch.mean(f.get_tensor('bias'), dim=0).squeeze(0).tolist()
+        harm_boundary = compute_decision_boundary(x_limits, y_limits, harm_coef, harm_intercept)
+        logging.info(f"Harmfulness boundary: {harm_boundary}")
 
-        weight1 = torch.tensor(weight, device='cuda', dtype=torch.float)
-        weight1_cut = weight1[:2] / torch.norm(weight1[:2])
-        weight1 = weight1 / torch.norm(weight1)
+        harm_coef_tensor = torch.tensor(harm_coef, device='cuda', dtype=torch.float)
+        harm_coef_normalized = harm_coef_tensor / torch.norm(harm_coef_tensor)
+        harm_coef_2d = harm_coef_tensor[:2] / torch.norm(harm_coef_tensor[:2])
 
+        # Plot refusal boundary
         with safe_open(f'estimations/{model_name}_all/refusal.safetensors', framework='pt') as f:
-            weight = torch.mean(f.get_tensor('weight'), dim=0).squeeze(0).tolist()
-            bias = torch.mean(f.get_tensor('bias'), dim=0).squeeze(0).tolist()
-        boundary_points = calculate_boundary(xlim, ylim, weight, bias)
-        logging.info(f"refusal boundary: {boundary_points}")
-        ax.plot([boundary_points[0][0], boundary_points[1][0]],
-                [boundary_points[0][1], boundary_points[1][1]],
+            refusal_coef = torch.mean(f.get_tensor('weight'), dim=0).squeeze(0).tolist()
+            refusal_intercept = torch.mean(f.get_tensor('bias'), dim=0).squeeze(0).tolist()
+        refusal_boundary = compute_decision_boundary(x_limits, y_limits, refusal_coef, refusal_intercept)
+        logging.info(f"Refusal boundary: {refusal_boundary}")
+        ax.plot([refusal_boundary[0][0], refusal_boundary[1][0]],
+                [refusal_boundary[0][1], refusal_boundary[1][1]],
                 color='tab:gray', alpha=1, linewidth=3, linestyle='--')
 
-        weight2 = torch.tensor(weight, device='cuda', dtype=torch.float)
-        weight2_cut = weight2[:2] / torch.norm(weight2[:2])
-        weight2 = weight2 / torch.norm(weight2)
+        refusal_coef_tensor = torch.tensor(refusal_coef, device='cuda', dtype=torch.float)
+        refusal_coef_normalized = refusal_coef_tensor / torch.norm(refusal_coef_tensor)
+        refusal_coef_2d = refusal_coef_tensor[:2] / torch.norm(refusal_coef_tensor[:2])
 
-        axins = inset_axes(ax, width="75%", height="3%", loc='upper center',
+        # Add colorbar
+        colorbar_axes = inset_axes(ax, width="75%", height="3%", loc='upper center',
                    bbox_to_anchor=(0, -0.01, 1, 1),
                    bbox_transform=ax.transAxes)
-        cb = plt.colorbar(sm, cax=axins, orientation='horizontal', pad=0.05)
-        cb.set_alpha(0.5)
+        colorbar = plt.colorbar(scalar_map, cax=colorbar_axes, orientation='horizontal', pad=0.05)
+        colorbar.set_alpha(0.5)
 
-        refusal_direction = - weight2_cut.cpu().numpy()
-        middle_point = ((boundary_points[0][0] + boundary_points[1][0]) / 2, (boundary_points[0][1] + boundary_points[1][1]) / 2)
-        boundary_length = np.sqrt((boundary_points[0][0] - boundary_points[1][0])**2 + (boundary_points[0][1] - boundary_points[1][1])**2)
-        direction_length = boundary_length * 0.2
-        vector = refusal_direction * direction_length
-        head_width = (xlim[1] - xlim[0]) * 0.02
-        start_point = (middle_point[0] - vector[0] / 2, middle_point[1] - vector[1] / 2)
-        ax.arrow(start_point[0], start_point[1], vector[0], vector[1],
-                 color='tab:gray', alpha=1, linewidth=3, head_width=head_width, head_length=head_width)
+        # Plot refusal direction arrow
+        refusal_direction = - refusal_coef_2d.cpu().numpy()
+        midpoint = ((refusal_boundary[0][0] + refusal_boundary[1][0]) / 2, (refusal_boundary[0][1] + refusal_boundary[1][1]) / 2)
+        boundary_length = np.sqrt((refusal_boundary[0][0] - refusal_boundary[1][0])**2 + (refusal_boundary[0][1] - refusal_boundary[1][1])**2)
+        arrow_length = boundary_length * 0.2
+        arrow_vector = refusal_direction * arrow_length
+        arrow_width = (x_limits[1] - x_limits[0]) * 0.02
+        arrow_start = (midpoint[0] - arrow_vector[0] / 2, midpoint[1] - arrow_vector[1] / 2)
+        ax.arrow(arrow_start[0], arrow_start[1], arrow_vector[0], arrow_vector[1],
+                 color='tab:gray', alpha=1, linewidth=3, head_width=arrow_width, head_length=arrow_width)
 
-        ax.set_xlim(xlim)
-        ax.set_ylim(ylim)
+        ax.set_xlim(x_limits)
+        ax.set_ylim(y_limits)
 
         if model_name in ['Llama-2-7b-chat-hf', 'vicuna-7b-v1.5', 'CodeLlama-7b-Instruct-hf', 'Mistral-7B-Instruct-v0.2']:
             ax.invert_xaxis()
 
-    fig.tight_layout()
-    fig.savefig(f"{args.output_path}/{fname}_{args.config}.pdf")
+    main_fig.tight_layout()
+    main_fig.savefig(f"{args.output_dir}/{output_filename}_{args.generation_mode}.pdf")
 
-    logging_cuda_memory_usage()
+    log_gpu_memory()
     torch.cuda.empty_cache()
     gc.collect()
 
